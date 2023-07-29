@@ -1,0 +1,523 @@
+---
+title: "Alzheimer data analysis"
+output: 
+  html_document:
+    code_download: true
+    df_print: paged
+    toc: true
+    toc_float:
+      toc_collapsed: true
+  keep_md: true
+  html_notebook: default
+editor_options: 
+  chunk_output_type: inline
+---
+
+In this data analysis project, I will carry out the analysis of a data table that contains various characteristics
+of subjects with dementia, non-dementia and suspected dementia. The criteria are broken down by column in the data table. I will refer to them as variables in the following. The original variables by content are:
+
+- ID: identifier
+- Group: demented, nondemented, suspected (converted)
+- M/F: No
+- Hand: Dominant hand
+- Age: Age
+- Educ: Level of education
+- SES: Socioeconomic status
+- MMSE: Score on the mini mental state clinical test
+- CDR: Score on the clinical dementia rating
+- eTIV: Estimated total intracranial volume
+- nWBV: Normalised brain volume.
+- ASF: Volume in relation to total intracranial volume, which measures head size by adjusting for the atlas factor.
+
+The main purpose of the analysis is to explore associations that cannot be explicitly read from the data, mainly classification problems and effects between variables and on dementia.
+
+```{r, include=FALSE}
+library(tidyverse)
+library(dplyr)
+library(quantmod)
+library(e1071)
+library(mlbench)
+library(magrittr)
+library(caret)
+library(ggplot2)
+library(rstanarm)
+library(performance)
+library(see)
+library(bayesplot)
+library(bayestestR)
+library(rstanarm)
+library(ggeffects)
+library(BayesPostEst)
+library(wooldridge)
+library(cowplot)
+library(randomForest)
+library(gridExtra)
+library(data.table)
+library(rpart.plot)
+library(RColorBrewer)
+library(rattle)
+```
+
+Read the file alzheimer.csv from the folder containing the R project.
+
+```{r}
+alz<- read.csv("alzheimer.csv")
+
+#Most nézzük meg milyen az adathalmaz felépítése. Ehhez néhány alapvető paramétert fogok lehívni,
+#mint a sorok, oszlopok hossza.
+
+nrow(alz)
+
+ncol(alz)
+```
+
+I load the whole data set as a tibble, for that purpose,
+to review more precisely whether there are missing data, where they are, if any,
+and the tibble tells me the types of data. 
+
+I assign tibble to the variable col_x.
+
+```{r}
+col_x <- as_tibble(alz)
+```
+
+I will double-check the apparently numerical data for completeness,
+because without numerical variables I will not be able to build usable models.
+
+```{r}
+col_x %>% select(3:10)
+col_x %>% select_if(is.numeric)
+```
+
+In the following operations, I standardise and convert each of the sorters into a scale variable, 
+so that the differences between the units of measurement do not hinder the construction of the models,
+and I also want to simplify the names of the variables, 
+so I do the operation one by one.
+
+```{r}
+
+data <- col_x['Age']
+vector <- pull(data)
+age <- as.data.frame(scale(vector))
+
+data1 <- col_x['EDUC']
+vector1 <- pull(data1)
+educ <- as.data.frame(scale(vector1))
+
+data2 <- col_x['SES']
+vector2 <- pull(data2)
+ses <- as.data.frame(scale(vector2))
+
+data3 <- col_x['MMSE']
+vector3 <- pull(data3)
+mmse <- as.data.frame(scale(vector3))
+
+data4 <- col_x['CDR']
+vector4 <- pull(data4)
+cdr <- as.data.frame(scale(vector4))
+
+data6 <- col_x['eTIV']
+vector6 <- pull(data6)
+etiv <- as.data.frame(scale(vector6))
+
+data7 <- col_x['nWBV']
+vector7 <- pull(data7)
+nwbv <- as.data.frame(scale(vector7))
+
+data8 <- col_x['ASF']
+vector8 <- pull(data8)
+asf <- as.data.frame(scale(vector8))
+```
+
+
+```{r}
+group <- alz['Group']
+class(group)
+```
+
+
+```{r}
+norm_data <- data.frame(group,age,educ,ses,mmse,cdr,etiv,nwbv,asf)
+as.data.frame(norm_data)
+colnames(norm_data) <- c('group','age','educ','ses','mmse','cdr','etiv','nwbv','asf')
+norm_data
+```
+
+For security, I duplicate norm_data by assigning it to norm_data2.
+This is necessary so that if the data is modified, lost or overwritten, the original is available.
+
+By checking the data and the group variable, you can see that the group variable type is character.
+I change this to factor and add it to norm_data2.
+
+```{r}
+norm_data2 <- norm_data
+class(norm_data2$group)
+norm_data2$group <- as.factor(norm_data2$group)
+class(norm_data2$group)
+str(norm_data2)
+norm_data2
+
+norm_data2$'ses'[is.na(norm_data2$'ses')] <- mean(norm_data2$'ses', na.rm = TRUE)
+norm_data2$'mmse'[is.na(norm_data2$'mmse')] <- mean(norm_data2$'mmse', na.rm = TRUE)
+
+```
+## Random Forest model
+
+For the random forest model, 
+for the categorical variable group (group1 in the following analysis),
+i.e. the categories (demented, non-demented, suspected dementia)
+the variable that has the most influence on the membership of the group. 
+
+Briefly, the principle of the random forest model according to bootstrap sampling
+(generates decision trees - typically many thousands of decision trees,
+in which the strength of the variables, rather than the strongest effect extracted from their interaction with each other, is obtained
+- as opposed to neural networks.
+
+In the following:
+- Assigning the original data to a new variable, I rename its columns,
+  view its structure, and then convert it to numeric for assignment to a new variable - lapply, sapply-,
+  but this time I don't standardize it - it's not necessary in this case, and I can get more meaningful plots.
+- I filter out the missing data - replace these values with the column average - alz_numeric$'ses1'....
+- I make the variable group1 a factor, add it to the numeric (alz_num data frame), 
+  and finally I filter out the randomly generated variables and revisit the structure.
+
+```{r, message=FALSE}
+alz_easy <- alz
+
+setnames(alz_easy, old = c('Group','Age','M.F','EDUC','SES','MMSE','CDR','eTIV','nWBV','ASF'), 
+         new = c('group1','age1','mf1','educ1','ses1','mmse1','cdr1','etiv1','nwbv1','asf1'))
+
+str(alz_easy)
+
+alz_numeric <- alz_easy[ , c('age1','educ1','ses1','mmse1','cdr1','etiv1','nwbv1','asf1')]
+
+alz_numeric[] <- lapply(alz_numeric, function(x) as.numeric(as.character(x)))
+alz_numeric
+sapply(alz_numeric, class)
+
+alz_numeric$'ses1'[is.na(alz_numeric$'ses1')] <- mean(alz_numeric$'ses1', na.rm = TRUE)
+alz_numeric$'mmse1'[is.na(alz_numeric$'mmse1')] <- mean(alz_numeric$'mmse1', na.rm = TRUE)
+
+dem_groups <- alz_easy['group1']
+
+dem_groups$group1 <- as.factor(dem_groups$group1)
+
+alz_num <- data.frame(dem_groups,alz_numeric)
+
+alz_num <- alz_num[,-(10:11)]
+
+str(alz_num)
+```
+
+Actually, how many cases are there in different categories?
+
+```{r}
+table(alz_num$group1)
+```
+
+Here:
+- I partition the data frame used so far into a test and a train data,
+  which I use to test the accuracy of the model and train it to work as accurately as possible 
+- I sample the data with probability sampling: 'prob=c(0.8,0.2)'. 
+- I create the model and then the first prediction by the model - from the train data. 
+  To do this, I first set the seed so that the model always takes the same sample.
+  From the predictions I create a confusionMatrix, where the correct and incorrect categories are shown.
+  
+```{r}
+independent <- sample(2, nrow(alz_num), replace=TRUE, prob=c(0.8,0.2))
+trainrf <- alz_num[independent==1,]
+testrf <- alz_num[independent==2,]
+
+set.seed(222)
+rfvar <- randomForest(group1~.,data=trainrf)
+print(rfvar)
+
+rfpred1 <- predict(rfvar, trainrf)
+head(rfpred1)
+confusionMatrix(rfpred1, trainrf$group1)
+```
+
+Here we see that the OOB estimation and accuracy values differ,
+this is because the OOB (as the error from unused data)
+was not used when bootstrap sampling the model.
+However, it is included in the data used to train the model,
+because it includes the error, which is essentially the OOB. 
+For both classification (in our case) and regression 
+(R-sq, RMSE), this error value determines the accuracy of the model.
+
+Let us also establish the prediction based on the data intended for the test.
+
+```{r}
+rfpred2 <- predict(rfvar, testrf)
+head(rfpred2)
+confusionMatrix(rfpred2, testrf$group1)
+```
+
+After the first random forest, and after the predictions run for training and testing, it is possible to tune the model, so I interpret the results only after the final model. 
+
+The amount of trees needed is determined by plot plotting, where the error rate will be shown by default.
+
+```{r}
+plot(rfvar)
+```
+
+After about 410 trees the value becomes constant, which means,
+that the accuracy of the model will not improve as the number of trees increases beyond 450.
+
+I am tuning the model, this time by the resulting constant value ('ntreetry=450') to find the ideal mtry value
+- the number of random variables for each settling - for a more accurate model. 
+
+The other parameters:
+
+First: The tuned model samples the data for training from the front of the data, then the back.
+Second: To determine the optimal trial ('mtry'), the value of mtry is inflated by the size of the number of each step.
+Third: number of trees.
+Fourth: Trace the process then print inline (or to console) -baseline setting.
+Fifth: Relative reduction of OOB error by the given value maximum.
+
+```{r, message=FALSE}
+rftune <- tuneRF(trainrf[,-1],trainrf[,1],
+          stepFactor=0.5,
+          plot=TRUE,
+          ntreeTry = 410,
+          trace=TRUE,
+          improve=0.05)
+```
+
+The smallest value is 2 ('mtry), so I re-run, view and plot the model as in the first test.
+I then see if the new model is more accurate by re-predicting the train and test data.
+
+```{r, message=FALSE}
+rfvar2 <- randomForest(group1~.,data=trainrf,
+                       ntree=410,
+                       mtry=2,
+                       importance=TRUE,
+                       proximity=TRUE)
+
+print(rfvar2)
+plot(rfvar2)
+
+
+rfpred1.2 <- predict(rfvar2, trainrf)
+head(rfpred1.2)
+confusionMatrix(rfpred1.2, trainrf$group)
+
+rfpred2.2 <- predict(rfvar2, testrf)
+head(rfpred2.2)
+confusionMatrix(rfpred2.2, testrf$group)
+```
+
+The new model is more accurate, as the value is constant after about 310 trees.
+
+In addition, we see the following in the results:
+
+1. randomForest - Confusion Matrix
+
+   It can be seen that the random forest model itself has become more accurate, as the OOB remains at 9.57%,
+   The number of correctly classified cases can be calculated, based on the logic introduced in the neural network.
+   
+2. testrf - Confusion Matrix, Overall Statistics
+   
+   For random forest models, it is worth investigating whether the prediction on the test data after tuning gives more accurate results. In the present case, it can be seen that neither the accurarcy for the confusion matrix nor the 
+   the sensitivity per category has not changed. This is basically possible because the first model is also quite accurate 
+   was, in fact, too accurate, since above 0.9 accuracy we can speak of a slight overfitting. 
+   The number of correctly classified cases can also be seen in the output.
+
+
+I plot on a histogram the distribution of nodes (number of branches/nodes of a given tree) for all trees.
+
+```{r}
+hist(treesize(rfvar2),
+     main = 'Node-ok eloszlása az összes fára nézve',
+     col = 'orange')
+```
+
+So most trees (about 90-120) have between 35-45 nodes.
+
+What are the most important variables?
+
+```{r}
+varImpPlot(rfvar2,
+           sort=T,
+           n.var=3,
+           main='Top 3 fontosságú változó')
+```
+
+It can be seen that the most important findings of the random forest model
+variable is the clinical dementia rate score ('cdr').
+
+The following graphs show the partial dependence, i.e. the relationship between the variables.
+I will also adjust the palette for this.
+
+```{r}
+par(mfrow=c(1,3))
+
+partplot1 <- partialPlot(rfvar2, trainrf, cdr1, 'Demented')
+partplot2 <- partialPlot(rfvar2, trainrf, mmse1, 'Demented')
+partplot3 <- partialPlot(rfvar2, trainrf, etiv1, 'Demented')
+
+par(mfrow=c(1,1))
+```
+
+The above results show that the cdr1 variable only starts to have a significant effect above 1.3,
+while the variable mmse1 has no significant effect above 23. In contrast, the etiv1 
+variable has a variable but overall increasing effect.
+
+
+
+Using the rpart package, I plot the two most important (with the highest predictive power) variables of the group, age, education, SES and nWBW variables in the decision tree of the rpart function according to its own decision tree algorithm.
+
+
+```{r}
+set.seed(1)
+tree_mmse <- rpart(mmse1 ~ group1 + age1 + educ1 + ses1 + nwbv1, alz_easy)
+tree_cdr <- rpart(cdr1 ~ group1 + age1 + educ1 + ses1 + nwbv1, alz_easy)
+
+fancyRpartPlot(tree_cdr, main = "A CDR pontszám változójának a döntési fája a csoport, a kor, a végzettség, a szocioökonómiai státusz és az agytérfogat változóinak a tükrében", palettes = "OrRd")
+```
+```{r}
+fancyRpartPlot(tree_mmse, main = "Az MMSE pontszám változójának a döntési fája a csoport, a kor, a végzettség, a szocioökonómiai státusz és az agytérfogat változóinak a tükrében", palettes = "GnBu")
+```
+
+## Bayesian linear regression
+
+I apply the Bayesian form of linear regression,
+where a prior distribution of values is used to estimate the final distribution of values (posterior).
+
+In the following: 
+
+- I define a model where both the prior and the prior distribution constants are set to a normal distribution.
+- R takes the posterior distribution of the sample using only the Monte-Carlo-Markov chain method, so I use that.
+- I perform the comparison of the posterior and prior distributions using the default settings of the posterior_vs_prior function.
+- pp_check: how much the distribution of the final median values differs from the sample distribution.
+- I plot the results on a distribution function.
+
+```{r, message=FALSE}
+theme_set(theme_bw())
+
+m1 <- stan_glm(mmse ~ cdr+nwbv+etiv+asf, 
+               prior = normal(),
+               prior_intercept = normal(),
+               data=norm_data2)
+mcmc_dens(m1)
+             
+posterior_vs_prior(m1,
+                   pars=c('cdr','etiv','nwbv','asf'),
+                   group_by_parameter = TRUE)+
+                   theme_bw()+guides(color='none')
+
+pp_check(m1,'dens_overlay')             
+
+plot(p_direction(m1))+
+  theme(legend.position = 'none',
+        title=element_blank())
+
+p_direction(m1)
+```
+
+The results show that only the variables 'cdr' and 'nwbv' performed above 89%, which are already significant in the Bayesian approach.
+
+## Analysing the effect of gender
+
+I convert the gender variable of the previously used alz.easy data frame into a factor.
+
+```{r}
+alz_easy$mf1 <- as.factor(alz_easy$mf1)
+```
+
+I merge the previously used data frames marked in the function into alz_final.
+
+```{r}
+alz_final <- data.frame(dem_groups,alz_easy$mf1,alz_numeric)
+```
+
+I summarize using the regex (str_detect) function, i.e. I count the number of women and men in the sample.
+
+```{r}
+sum(str_detect(alz_final[,2], 'F'))
+
+sum(str_detect(alz_final[,2], 'M'))
+```
+
+I also replace the missing values in the alz.final data table with the column average.
+
+```{r}
+alz_final$'ses1'[is.na(alz_final$'ses1')] <- mean(alz_final$'ses1', na.rm = TRUE)
+alz_final$'mmse1'[is.na(alz_final$'mmse1')] <- mean(alz_final$'mmse1', na.rm = TRUE)
+```
+
+It is well known that educational level has a major impact on the development of dementia,
+i.e. the less educated group has a higher prevalence of memory impairment.
+In what follows, I will try to describe which are not more educated, in addition, 
+which of the educated groups are more likely to have dementia.
+
+Mean score of education:
+
+```{r}
+mean(alz_final$educ1)
+```
+
+Educ_male data frame, which contains cases of more educated men than average.
+
+```{r}
+educ_male <- alz_final[alz_final$educ1 > 14 & alz_final$alz_easy.mf1  == 'M',]
+```
+
+Educ_female data frame, which contains cases of above-average female education.
+
+```{r}
+educ_female <- alz_final[alz_final$educ1 > 14 & alz_final$alz_easy.mf1  == 'F',]
+```
+
+How many educated male cases are there, and how many of them have dementia?
+
+```{r}
+sum(str_detect(educ_male[,2], 'M'))
+
+sum(str_detect(educ_male[,1], '^Dem'))
+```
+
+How many cases of women are treated and how many of them have dementia?
+
+```{r}
+sum(str_detect(educ_female[,2], 'F'))
+
+sum(str_detect(educ_female[,1], '^Dem'))
+```
+
+What is the average age of educated women and men?
+
+```{r}
+
+mean(educ_male$age1)
+
+mean(educ_female$age1)
+```
+
+I plot the minimum, maximum and median ages of dementia, non-dementia and suspected dementia cases:
+
+```{r}
+eduplot <- ggplot(data = alz_final) + 
+             stat_summary(
+              mapping = aes(x = group1, y = age1),
+              fun.min = min,
+              fun.max = max,
+              fun = median,
+   
+  ) 
+
+eduplot+ggtitle("A csoportok leíró paraméterei") +
+  xlab("Csoportok") + ylab("Életkor")
+```
+
+Finally, I will produce a summary graph of the gender distribution.
+
+```{r, message=FALSE}
+alz_group_sex <- alz_easy %>% 
+  group_by(group1, mf1) %>%
+  summarize(total = n())
+
+ggplot(data = alz_group_sex, aes(x = group1, y = total, fill = mf1))+ geom_bar(postion = "stack", stat = "identity") +
+  labs(title = "Nemek szerinti eloszlás az egyes csoportokban", fill = 'Nem (F - Nő, M - Férfi)') + xlab("Csoport") + ylab("Személyek száma")
+
+```
